@@ -43,6 +43,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <assert.h>
 
 #include <blkid.h>
 #define NO_INLINE_FUNCS
@@ -54,8 +55,6 @@
 #include <nih/macros.h>
 #include <nih/alloc.h>
 #include <nih/string.h>
-#include <nih/list.h>
-#include <nih/hash.h>
 #include <nih/main.h>
 #include <nih/logging.h>
 #include <nih/error.h>
@@ -185,6 +184,20 @@ struct filemap_tep {
 	struct tep_format_field  *last_index; /* May be NULL */
 };
 
+/* Hash table entry for processed path bookkeeping. */
+struct path_data {
+	struct path_data *next;
+	unsigned long hash;
+	char *path;
+};
+
+/* Hash table entry for processed dev:inode bookkeeping. */
+struct dev_inode_data {
+	struct dev_inode_data *next;
+
+	dev_t dev_id;
+	ino_t inode;
+};
 
 /* Prototypes for static functions */
 static int       read_trace          (const void *parent,
@@ -243,6 +256,12 @@ static struct device_data   *find_device        (struct device_data **device_has
 static void		 add_inodes	(struct device_data **device_hash,
 					 PackFile **files, size_t *num_files,
 					 int force_ssd_mode);
+static int find_path (struct path_data **path_table, const char *pathname);
+static void add_path (struct path_data **path_table, const char *pathname);
+static int find_dev_inode_pair (struct dev_inode_data **dev_inode_table,
+				dev_t dev_id, ino_t inode);
+static void add_dev_inode_pair (struct dev_inode_data **dev_inode_table,
+				dev_t dev_id, ino_t inode);
 
 static inline off_t
 min (const off_t a, const off_t b)
@@ -458,6 +477,7 @@ struct read_trace_context {
 	int			 force_ssd_mode;
 
 	struct device_data       *device_hash[HASH_SIZE];
+	struct file_path         *file_path_hash[HASH_SIZE];
 };
 
 static void
@@ -1011,13 +1031,12 @@ trace_add_path (const void *parent,
 		size_t *    num_files,
 		int         force_ssd_mode)
 {
-	static NihHash *path_hash = NULL;
+	static struct path_data **path_hash = NULL;
 	struct stat     statbuf;
 	int             fd;
 	PackFile *      file;
 	PackPath *      path;
-	static NihHash *inode_hash = NULL;
-	nih_local char *inode_key = NULL;
+	static struct dev_inode_data **inode_hash = NULL;
 
 	nih_assert (pathname != NULL);
 	nih_assert (files != NULL);
@@ -1049,18 +1068,14 @@ trace_add_path (const void *parent,
 	/* Use a hash table of paths to eliminate duplicate path names from
 	 * the table since that would waste pack space (and fds).
 	 */
-	if (! path_hash)
-		path_hash = NIH_MUST (nih_hash_string_new (NULL, 2500));
+	if (! path_hash) {
+		path_hash = calloc (HASH_SIZE, sizeof (struct path_data *));
+	}
 
-	if (nih_hash_lookup (path_hash, pathname)) {
+	if (find_path (path_hash, pathname)) {
 		return 0;
 	} else {
-		NihListEntry *entry;
-
-		entry = NIH_MUST (nih_list_entry_new (path_hash));
-		entry->str = NIH_MUST (nih_strdup (entry, pathname));
-
-		nih_hash_add (path_hash, &entry->entry);
+		add_path (path_hash, pathname);
 	}
 
 	/* Make sure that we have an ordinary file
@@ -1128,24 +1143,15 @@ trace_add_path (const void *parent,
 	 * Use a hash table of dev_t/ino_t pairs to make sure we only
 	 * read the blocks of an actual file the first time.
 	 */
-	if (! inode_hash)
-		inode_hash = NIH_MUST (nih_hash_string_new (NULL, 2500));
+	if (! inode_hash) {
+		inode_hash = calloc (HASH_SIZE, sizeof (struct dev_inode_data *));
+	}
 
-	inode_key = NIH_MUST (nih_sprintf (NULL, "%llu:%llu",
-					   (unsigned long long)statbuf.st_dev,
-					   (unsigned long long)statbuf.st_ino));
-
-	if (nih_hash_lookup (inode_hash, inode_key)) {
+	if (find_dev_inode_pair (inode_hash, statbuf.st_dev, statbuf.st_ino)) {
 		close (fd);
 		return 0;
 	} else {
-		NihListEntry *entry;
-
-		entry = NIH_MUST (nih_list_entry_new (inode_hash));
-		entry->str = inode_key;
-		nih_ref (entry->str, entry);
-
-		nih_hash_add (inode_hash, &entry->entry);
+		add_dev_inode_pair (inode_hash, statbuf.st_dev, statbuf.st_ino);
 	}
 
 	/* There's also no point reading zero byte files, since they
@@ -2036,4 +2042,92 @@ static struct device_data *find_device (struct device_data **device_hash,
 	}
 
 	return dev;
+}
+
+/* Simple DJB2 hashing. */
+static inline unsigned int
+hash_string (const char *string)
+{
+	size_t i;
+	unsigned int hash_output = 5381;
+	size_t length = strlen (string);
+
+	for (i = 0; i < length; i++) {
+		hash_output = (hash_output << 5) + hash_output + string[i];
+	}
+
+	return hash_output;
+}
+
+static int find_path (struct path_data **path_table, const char *pathname)
+{
+	unsigned int hash = hash_string (pathname);
+	int key = hash & HASH_MASK;
+
+	struct path_data *data;
+	for (data = path_table[key]; data; data = data->next) {
+		if (data->hash == hash && strcmp (pathname, data->path) == 0) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static void add_path (struct path_data **path_table, const char *pathname)
+{
+	unsigned int hash = hash_string (pathname);
+	int key = hash & HASH_MASK;
+
+	struct path_data *data = calloc (1, sizeof (struct path_data));
+	assert (data != NULL);
+
+	data->hash = hash;
+	data->path = strdup (pathname);
+	assert (data->path != NULL);
+
+	if (path_table[key]) {
+		data->next = path_table[key];
+	}
+
+	path_table[key] = data;
+}
+
+static int
+find_dev_inode_pair (struct dev_inode_data **dev_inode_table, dev_t dev_id, ino_t inode)
+{
+	/* We use inode for more uniquely distributed key
+	 * as opposed to device id.
+	 */
+	int key = inode & HASH_MASK;
+	struct dev_inode_data *data;
+
+	for (data = dev_inode_table[key]; data; data = data->next) {
+		if (data->inode == inode && data->dev_id == dev_id) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static void
+add_dev_inode_pair (struct dev_inode_data **dev_inode_table, dev_t dev_id, ino_t inode)
+{
+	/* We use inode for more uniquely distributed key
+	 * as opposed to device id.
+	 */
+	int key  = inode & HASH_MASK;
+
+	struct dev_inode_data *data = calloc (1, sizeof (struct dev_inode_data));
+	assert (data != NULL);
+
+	data->dev_id = dev_id;
+	data->inode  = inode;
+
+	if (dev_inode_table[key]) {
+		data->next = dev_inode_table[key];
+	}
+
+	dev_inode_table[key] = data;
 }
