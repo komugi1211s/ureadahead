@@ -55,8 +55,6 @@
 #include <nih/macros.h>
 #include <nih/alloc.h>
 #include <nih/string.h>
-#include <nih/list.h>
-#include <nih/hash.h>
 #include <nih/main.h>
 #include <nih/logging.h>
 #include <nih/error.h>
@@ -1031,13 +1029,12 @@ trace_add_path (const void *parent,
 		size_t *    num_files,
 		int         force_ssd_mode)
 {
-	static NihHash *path_hash = NULL;
 	struct stat     statbuf;
 	int             fd;
 	PackFile *      file;
 	PackPath *      path;
-	static NihHash *inode_hash = NULL;
-	nih_local char *inode_key = NULL;
+	static struct dev_inode_data **inode_hash = NULL;
+	static struct path_data **path_hash = NULL;
 
 	nih_assert (pathname != NULL);
 	nih_assert (files != NULL);
@@ -1069,19 +1066,13 @@ trace_add_path (const void *parent,
 	/* Use a hash table of paths to eliminate duplicate path names from
 	 * the table since that would waste pack space (and fds).
 	 */
-	if (! path_hash)
-		path_hash = NIH_MUST (nih_hash_string_new (NULL, 2500));
-
-	if (nih_hash_lookup (path_hash, pathname)) {
-		return 0;
-	} else {
-		NihListEntry *entry;
-
-		entry = NIH_MUST (nih_list_entry_new (path_hash));
-		entry->str = NIH_MUST (nih_strdup (entry, pathname));
-
-		nih_hash_add (path_hash, &entry->entry);
+	if (! path_hash) {
+		path_hash = calloc (HASH_SIZE, sizeof (struct path_data *));
+		assert (path_hash != NULL);
 	}
+
+	if (! maybe_insert_path (path_hash, pathname))
+		return 0;
 
 	/* Make sure that we have an ordinary file
 	 * This avoids us opening a fifo or socket or symlink.
@@ -1148,25 +1139,13 @@ trace_add_path (const void *parent,
 	 * Use a hash table of dev_t/ino_t pairs to make sure we only
 	 * read the blocks of an actual file the first time.
 	 */
-	if (! inode_hash)
-		inode_hash = NIH_MUST (nih_hash_string_new (NULL, 2500));
-
-	inode_key = NIH_MUST (nih_sprintf (NULL, "%llu:%llu",
-					   (unsigned long long)statbuf.st_dev,
-					   (unsigned long long)statbuf.st_ino));
-
-	if (nih_hash_lookup (inode_hash, inode_key)) {
-		close (fd);
-		return 0;
-	} else {
-		NihListEntry *entry;
-
-		entry = NIH_MUST (nih_list_entry_new (inode_hash));
-		entry->str = inode_key;
-		nih_ref (entry->str, entry);
-
-		nih_hash_add (inode_hash, &entry->entry);
+	if (! inode_hash) {
+		inode_hash = calloc (HASH_SIZE, sizeof (struct dev_inode_data *));
+		assert (inode_hash != NULL);
 	}
+
+	if (! maybe_insert_dev_inode_pair (inode_hash, statbuf.st_dev, statbuf.st_ino))
+		return 0;
 
 	/* There's also no point reading zero byte files, since they
 	 * won't have any blocks (and we can't mmap zero bytes anyway).
