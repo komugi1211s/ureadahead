@@ -73,6 +73,14 @@ static int daemonise = 0;
 static int force_trace = 0;
 
 /**
+ * record_and_replay:
+ *
+ * Set to 1 if we should both enable tracing and perform readahead
+ * process. Mutually exclusive from --force-trace and --dump.
+ **/
+static int record_and_replay = 0;
+
+/**
  * timeout:
  *
  * Set to non-zero if we should stop tracing after a particular time,
@@ -210,6 +218,7 @@ static struct option options[] = {
 	{ "dump", no_argument, &dump_pack, 1 },
 	{ "use-existing-trace-events", no_argument, &use_existing_trace_events, 1 },
 	{ "force-ssd-mode", no_argument, &force_ssd_mode, 1 },
+	{ "record-and-replay", no_argument, &record_and_replay, 1 },
 
 	/*
 	 * boolean flags that has a special handling
@@ -239,6 +248,9 @@ print_usage () {
 		"    Detach and run in background\n"
 		"  --force-trace\n"
 		"    Ignore existing pack file and force retracing\n"
+		"  --record-and-replay\n"
+		"    Perform tracing and replaying together\n"
+		"    Mutually exclusive with --force-trace and --dump\n"
 		"  --timeout=SECONDS\n"
 		"    Maximum duration of tracing (default: unset; continue until interrupt)\n"
 		"  --dump\n"
@@ -402,6 +414,15 @@ main (int   argc,
 	if ((path_position = parse_options (argc, argv)) == -1)
 		exit (1);
 
+	/* force_trace and record_and_replay is incompatible;
+	 * so is dump_pack and record_and_replay.
+	 */
+	if ((dump_pack || force_trace) && record_and_replay) {
+		log_fatal ("--record-and-replay flag is mutually exclusive from "
+			   "--force-trace or --dump. exiting");
+		exit (1);
+	}
+
 	/* Lookup the filename for the pack based on the path given
 	 * (if any).
 	 */
@@ -412,6 +433,19 @@ main (int   argc,
 	assert (filename != NULL);
 
 	struct trace_context trace_ctx;
+
+	/* We could check if the pack file exists before enabling tracepoints
+	 * so we can unify the trace_begin call into 1 location, but doing so
+	 * comes with a cost of losing earlier file accesses that could be
+	 * impactful to boot time.
+	 */
+	if (record_and_replay) {
+		if (trace_begin (&trace_ctx, daemonise, use_existing_trace_events) < 0) {
+			log_fatal ("Failed to enable tracepoints for recording. exiting");
+			exit (6);
+		}
+		signal_setup ();
+	}
 
 	if (! force_trace) {
 		/* Read the current pack file */
@@ -428,26 +462,31 @@ main (int   argc,
 				exit (3);
 			}
 
-			exit (0);
-		}
+			log_info ("Completed readahead step.");
 
-		/* Error reading file means we retrace if not given a PATH,
-		 * otherwise we error out.
-		 */
-		if (argv[path_position] || dump_pack) {
-			log_fatal ("Pack file required, but couldn't be opened. exiting");
-			exit (4);
+			if (! record_and_replay)
+				exit (0);
 		} else {
-			log_info ("Could not open a pack file, retracing");
+			/* Error reading file means we retrace if not given a PATH,
+			 * otherwise we error out.
+			 */
+			if (argv[path_position] || dump_pack) {
+				log_fatal ("Pack file required, but couldn't be opened. exiting");
+				exit (4);
+			} else {
+				log_info ("Could not open a pack file, retracing");
+			}
 		}
 	}
 
-	/* Trace to generate new pack files */
-	if (trace_begin (&trace_ctx, daemonise, use_existing_trace_events) < 0) {
-		log_fatal ("Failed to enable tracepoints for recording. exiting");
-		exit (6);
+	if (! record_and_replay) {
+		if (trace_begin (&trace_ctx, daemonise, use_existing_trace_events) < 0) {
+			log_fatal ("Failed to enable tracepoints for recording. exiting");
+			exit (6);
+		}
+		signal_setup ();
 	}
-	signal_setup ();
+
 	signal_wait (timeout);
 	signal_cleanup ();
 	if (trace_process_events (&trace_ctx, filename, pack_file,
